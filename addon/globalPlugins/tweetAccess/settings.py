@@ -61,11 +61,13 @@ OPTIONAL_TAB_CHOICES = [
 	# Translators: Tab name in the optional tabs checklist in Settings > Display.
 	("notifications", _("Notifications")),
 	# Translators: Tab name in the optional tabs checklist in Settings > Display.
+	("chat", _("Chat (experimental)")),
+	# Translators: Tab name in the optional tabs checklist in Settings > Display.
+	("people", _("People")),
+	# Translators: Tab name in the optional tabs checklist in Settings > Display.
 	("bookmarks", _("Bookmarks")),
 	# Translators: Tab name in the optional tabs checklist in Settings > Display.
 	("lists", _("Lists")),
-	# Translators: Tab name in the optional tabs checklist in Settings > Display.
-	("people", _("People")),
 ]
 
 ENTER_ACTION_CHOICES = [
@@ -136,7 +138,7 @@ TARGET_CHOICES = [
 
 BG_KEYS = {
 	"home": "bg_interval", "notifications": "bg_interval_notifications",
-	"bookmarks": "bg_interval_bookmarks", "tabs": "bg_interval_tabs",
+	"bookmarks": "bg_interval_bookmarks", "tabs": "bg_interval_tabs", "trends": "bg_interval_trends",
 }
 
 UPDATE_ROWS = [  # the tabs every account has, first rows of the Updates table
@@ -1024,6 +1026,8 @@ class UpdatesPage(wx.Panel):
 			("notifications", _("Check &Notifications:")),
 			# Translators: Label of a background check interval choice (Bookmarks).
 			("bookmarks", _("Check boo&kmarks:")),
+			# Translators: Label of a background check interval choice (the trends of the Search and explore tab).
+			("trends", _("Check t&rends:")),
 		]
 		# Translators: Label of the background check interval choice of one open tab. {name} is the tab name.
 		rows += [(ident, _("Check {name}:").format(name=names[ident].replace("&", "&&"))) for ident in self._tab_ids]

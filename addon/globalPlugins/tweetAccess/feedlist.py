@@ -134,7 +134,24 @@ class HashtagDialog(wx.Dialog):
 		return [self._tags[i] for i in checked]
 
 
+class VirtualList(wx.ListCtrl):
+	"""A report list that holds no rows: the text of a cell is asked of the panel when the control draws or
+	reads it, so opening a tab costs nothing per row. InsertItem and SetItem must not be used on it."""
+
+	def __init__(self, parent, cell_text):
+		super().__init__(parent, style=wx.LC_REPORT | wx.LC_VIRTUAL)
+		self._cell_text = cell_text
+
+	def OnGetItemText(self, item, col):
+		return self._cell_text(item, col)
+
+	def DeleteAllItems(self):
+		self.SetItemCount(0)
+		return True
+
+
 class TweetPanel(wx.Panel):
+	VIRTUAL = False        # the list is a VirtualList (see _virtual_text); the tab turns it on
 	TRACKS_UNREAD = True   # unread count, Space, mark read/unread
 	SUPPORTS_NTH = True    # Alt+1..9
 	SORTED = True          # rows follow the sort setting (otherwise: the order given)
@@ -148,7 +165,8 @@ class TweetPanel(wx.Panel):
 		"user_open_web": ("_do_user_open_web", False), "user_followers": ("_do_user_followers", False),
 		"user_following": ("_do_user_following", False), "user_known_followers": ("_do_user_known_followers", False),
 		"user_follow": ("_do_user_follow", False), "user_mute": ("_do_user_mute", False),
-		"user_block": ("_do_user_block", False), "quotes": ("_do_quotes", True),
+		"user_block": ("_do_user_block", False), "user_message": ("_do_user_message", False),
+		"quotes": ("_do_quotes", True),
 		"reply": ("_do_reply", True), "retweet": ("_do_retweet", True), "like": ("_do_like", True),
 		"bookmark": ("_do_bookmark", True), "hashtags": ("_do_hashtags", False), "quote_tweet": ("_do_quote", True),
 		"open_browser": ("_do_browser", True), "links": ("_do_links", False), "full_tweet": ("_show_full", False),
@@ -183,8 +201,9 @@ class TweetPanel(wx.Panel):
 		self._quiet_depth = 0  # >0: focus events come from our own code, not the reader
 		self._expanded = set()  # ids of rows shown in full (auto read, main window)
 		self._posts = self._new_posts()
+		self._cell_cache = {}  # virtual list: post id -> the cells of its row, built when the control asks
 
-		self.list = wx.ListCtrl(self, style=wx.LC_REPORT)
+		self.list = VirtualList(self, self._virtual_text) if self.VIRTUAL else wx.ListCtrl(self, style=wx.LC_REPORT)
 		self._cols = None
 		self._build_columns()
 
@@ -197,7 +216,7 @@ class TweetPanel(wx.Panel):
 		self.status.SetName(_("Tweets status"))
 
 		sizer = wx.BoxSizer(wx.VERTICAL)
-		buttons = wx.BoxSizer(wx.HORIZONTAL)
+		self._buttons = buttons = wx.BoxSizer(wx.HORIZONTAL)
 		buttons.Add(self.action_btn, 0, wx.RIGHT, 8)
 		buttons.Add(self.user_btn, 0)
 		sizer.Add(self.list, 1, wx.EXPAND | wx.ALL, 8)
@@ -256,7 +275,46 @@ class TweetPanel(wx.Panel):
 	def _cell_texts(self, post, opts):
 		return cell_texts(post, *opts, full=post.id in self._expanded)
 
+	def _virtual_text(self, index, col):
+		"""Virtual list: the text of one cell, asked by the control when it draws or reads it. NVDA asks cell
+		by cell, so the cells of a row are built once and kept until the row changes (see _cell_cache)."""
+		rows = self._posts.rows
+		if not 0 <= index < len(rows) or not self._cols or not 0 <= col < len(self._cols):
+			return ""
+		post = rows[index]
+		cells = self._cell_cache.get(post.id)
+		if cells is None:
+			cells = self._cell_cache[post.id] = self._cell_texts(post, self._opts())
+		return cells[self._cols[col]]
+
+	def _refresh_rows(self):
+		"""Virtual list: draw the rows again (the range is clamped: a timer can fire after the list was emptied)."""
+		count = min(len(self._posts), self.list.GetItemCount())
+		if count:
+			self.list.RefreshItems(0, count - 1)
+
+	def _sync_virtual(self, keep_id=None, selected=()):
+		"""Virtual list: the rows changed in self._posts. The control keeps its selection and focus by index, so a
+		row that moved would leave them on another tweet: the selected tweets (ids) and the focused one (keep_id)
+		get them back by their place now."""
+		with self._quiet():
+			self.list.SetItemCount(len(self._posts))
+			self._clear_selection(-1)
+			for post_id in selected:
+				idx = self._posts.index_of(post_id)
+				if idx >= 0:
+					self.list.SetItemState(idx, wx.LIST_STATE_SELECTED, wx.LIST_STATE_SELECTED)
+			idx = self._posts.index_of(keep_id) if keep_id is not None else -1
+			if idx >= 0:
+				self.list.Focus(idx)
+			self._refresh_rows()
+
 	def _set_row(self, idx, post, opts, insert):
+		if self.VIRTUAL:
+			if not insert:  # a row shown another way (auto read): its cells are built again
+				self._cell_cache.pop(post.id, None)
+				self.list.RefreshItem(idx)
+			return
 		t0 = time.perf_counter()  # TEMP
 		texts = self._cell_texts(post, opts)
 		t1 = time.perf_counter()  # TEMP
@@ -296,6 +354,10 @@ class TweetPanel(wx.Panel):
 		if self._dead or not self.IsShownOnScreen():
 			return
 		started = time.perf_counter()  # TEMP
+		if self.VIRTUAL:
+			self._cell_cache.clear()  # the cells are built again, with the new times, when the control asks
+			self._refresh_rows()
+			return
 		_a, mode, pattern = self._opts()
 		time_col = self._cols.index("time")
 		for i, p in enumerate(self._posts.rows):
@@ -328,6 +390,7 @@ class TweetPanel(wx.Panel):
 	def _reset_list(self):
 		with self._quiet():
 			self.list.DeleteAllItems()
+		self._cell_cache.clear()
 		self._posts = self._new_posts()
 		self._expanded = set()
 		self._update_status(notify=False)  # callers add rows next, or call _update_status() themselves
@@ -343,17 +406,28 @@ class TweetPanel(wx.Panel):
 		ordered = sorted(posts, key=lambda p: p.id, reverse=True) if self.SORTED else list(posts)
 		if not self.SORTED and not older and getattr(self._posts, "flipped", False):
 			ordered.reverse()
-		self.list.Freeze()
-		try:
-			with self._quiet():
-				for p in ordered:
-					idx = self._posts.add(p, older)
-					if idx is None:
-						continue
-					self._set_row(idx, p, opts, insert=True)
+		if self.VIRTUAL:
+			keep_id = self._current_post_id()  # the control keeps focus and selection by index: see _sync_virtual
+			selected = [p.id for p in self._selected_posts()]
+			for p in ordered:
+				if self._posts.add(p, older) is not None:
 					added.append(p)
-		finally:
-			self.list.Thaw()
+			t_sync = time.perf_counter()  # TEMP
+			if added:
+				self._sync_virtual(keep_id, selected)
+			self._t_wx = time.perf_counter() - t_sync  # TEMP
+		else:
+			self.list.Freeze()
+			try:
+				with self._quiet():
+					for p in ordered:
+						idx = self._posts.add(p, older)
+						if idx is None:
+							continue
+						self._set_row(idx, p, opts, insert=True)
+						added.append(p)
+			finally:
+				self.list.Thaw()
 		if fresh and added and self.TRACKS_UNREAD:
 			unread = self._plugin.store.unread_among(self._aid(), [p.id for p in added])
 			for p in added:
@@ -785,6 +859,9 @@ class TweetPanel(wx.Panel):
 	def _do_user_block(self, post, row=None):
 		self.GetTopLevelParent().run_user_action("user_block", post)
 
+	def _do_user_message(self, post, row=None):
+		self.GetTopLevelParent().run_user_action("user_message", post)
+
 	def _do_reply(self, post, row=None):
 		self._plugin.open_compose(reply_to=post)
 
@@ -959,6 +1036,9 @@ class TweetPanel(wx.Panel):
 			return
 		if keymap.matches(event, "check_updates"):
 			self.onCheckForUpdates(None)
+			return
+		if keymap.matches(event, "edit_search") and callable(getattr(self, "edit_search", None)):
+			self.edit_search()  # only the search tabs have it
 			return
 		if self.CAN_OLDER and keymap.matches(event, "load_older"):
 			self.onFetchOlder()

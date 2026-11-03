@@ -15,7 +15,6 @@ from logHandler import log
 
 from . import keymap, soundpack, tabstate
 from .dialogs import UserInfoDialog
-from .searchdialog import SearchDialog
 from .tabs import QuotesPanel, ThreadPanel, create_feed_tab, make_temp_tab
 from .useractions import populate_user_menu, relation_texts
 from .userstab import UsersTab
@@ -48,13 +47,12 @@ class MainWindow(wx.Frame):
 		toolbar = wx.BoxSizer(wx.HORIZONTAL)
 		# Translators: Toolbar buttons. The shortcut is added after the label, so there is no access key.
 		self.checkUpdatesButton = wx.Button(panel, label=_("Check for updates"))
-		self.searchButton = wx.Button(panel, label=_("Search"))
 		self.newButton = wx.Button(panel, label=_("New tweet"))
 		self.settingsButton = wx.Button(panel, label=_("Settings"))
 		self.removeTabButton = wx.Button(panel, label=_("Remove current tab"))
 		self._button_labels = [
 			(button, button.GetLabel(), action_id) for button, action_id in (
-				(self.checkUpdatesButton, "check_updates"), (self.searchButton, "search"),
+				(self.checkUpdatesButton, "check_updates"),
 				(self.newButton, "new_tweet"), (self.settingsButton, "settings"),
 				(self.removeTabButton, "remove_tab"),
 			)
@@ -63,7 +61,7 @@ class MainWindow(wx.Frame):
 		# Translators: Toolbar button that closes the window.
 		self.closeButton = wx.Button(panel, label=_("&Close"))
 		for button in (
-			self.checkUpdatesButton, self.searchButton, self.newButton, self.settingsButton, self.removeTabButton,
+			self.checkUpdatesButton, self.newButton, self.settingsButton, self.removeTabButton,
 			self.closeButton,
 		):
 			toolbar.Add(button, 0, wx.RIGHT, 5)
@@ -74,8 +72,7 @@ class MainWindow(wx.Frame):
 		panel.SetSizer(sizer)
 
 		self.checkUpdatesButton.Bind(wx.EVT_BUTTON, self.onCheckForUpdates)
-		self.searchButton.Bind(wx.EVT_BUTTON, lambda e: self.search())
-		self.newButton.Bind(wx.EVT_BUTTON, lambda e: self._plugin.open_compose())
+		self.newButton.Bind(wx.EVT_BUTTON, lambda e: self.new_item())
 		self.settingsButton.Bind(wx.EVT_BUTTON, lambda e: self._plugin.open_settings())
 		self.removeTabButton.Bind(wx.EVT_BUTTON, lambda e: self.removeCurrentTab())
 		self.closeButton.Bind(wx.EVT_BUTTON, lambda e: self.Close())
@@ -221,6 +218,7 @@ class MainWindow(wx.Frame):
 		else:
 			self.removeTabButton.Show(getattr(self.notebook.GetPage(index), "TAB_REMOVABLE", True))
 		self.removeTabButton.GetContainingSizer().Layout()
+		self._update_new_button()
 
 	def onPageChanging(self, evt):
 		# Focus on the notebook before the swap: a focused control that gets hidden makes
@@ -444,25 +442,54 @@ class MainWindow(wx.Frame):
 	# ------------------------------------------------------------ feeds: user timeline, search, list
 
 	def search(self):
+		"""Ctrl+F: the search field of the Search and explore tab, with the hashtags and users of the tweet in focus
+		to add to the search."""
 		if self._plugin.account_id() is None:
 			ui.message(_("Add an account first."))
 			return
-		dlg = SearchDialog(self, self._search_suggestions(), self._plugin.config)
-		try:
-			if dlg.ShowModal() != wx.ID_OK:
+		suggestions = self._search_suggestions()
+		for i, panel in enumerate(self.getOpenTabs()):
+			if getattr(panel, "TAB_KEY", None) == "explore":
+				panel.prepare(suggestions)
+				self.notebook.SetSelection(i)
+				wx.CallAfter(panel.focus_query)
 				return
-			query, product = dlg.values()
-		finally:
-			dlg.Destroy()
-		if not query:
-			return
-		self.open_search(query, product)
 
-	def open_search(self, query, product="Latest"):
-		"""A search tab. Its name is the query exactly as it is sent to X."""
+	def open_people_search(self, query):
+		"""A tab with the users a search for query finds, one tab for each query."""
+		key = "search:%s" % query
+		if self.focusTabByIdentity({"kind": "users", "key": key}):
+			return
+		origin = self._origin_key()
+		job = lambda result: self._users_fetched("search", query, key, origin, result)
+		options = {
+			"kind": "search", "params": {"handle": query, "query": query}, "chain": key,
+			"pages": self._plugin.config.get("feed_pages"),
+		}
+		if not self._plugin.start_job("users", job, options):
+			announce_now(_("Still loading, please wait."))
+			return
+		announce_now(_("Loading, please wait."))
+
+	def open_search(self, query, product="Latest", form=None):
+		"""A search tab. Its name is the query exactly as it is sent to X. form: what was typed in the Search and
+		explore tab to make it, kept so the search can be edited."""
 		# Translators: Name of a search tab. {query} is the search text exactly as sent to X.
 		name = _("Search: {query}").format(query=query)
-		self.open_feed("search", "%s|%s" % (product, query), {"query": query, "product": product}, name)
+		params = {"query": query, "product": product}
+		if form:
+			params["form"] = form
+		self.open_feed("search", "%s|%s" % (product, query), params, name)
+
+	def edit_search(self, params):
+		"""The form of the Search and explore tab filled with a search that was run, to change it and run it again."""
+		for i, panel in enumerate(self.getOpenTabs()):
+			if getattr(panel, "TAB_KEY", None) == "explore":
+				panel.prepare([])
+				panel.load_search(params)
+				self.notebook.SetSelection(i)
+				wx.CallAfter(panel.focus_query)
+				return
 
 	def _search_suggestions(self):
 		"""Hashtags and @users of the tweet in focus, to add to a search."""
@@ -555,6 +582,7 @@ class MainWindow(wx.Frame):
 			"user_block": lambda: self.change_relation("block", handle, uid),
 			"user_copy_url": lambda: self.copy_user_url(post, handle),
 			"user_open_web": lambda: self.open_user_web(post, handle),
+			"user_message": lambda: self.start_chat(handle, uid),
 		}
 		handlers[action]()
 
@@ -610,6 +638,11 @@ class MainWindow(wx.Frame):
 		"""active: the relation is on now, so the action undoes it. What can be undone is done at once and said at
 		once, before X has answered (an error is told afterwards); a block or an unfollow asks first."""
 		action = self._RELATION_UNDO[kind] if active else kind
+		if action == "unblock":
+			# X answers 404 to the unblock of this client, the web page's own request works: it is done on x.com
+			announce_now(_("Unblocking does not work from here at the moment. Opening the profile on x.com."))
+			webbrowser.open("https://x.com/" + handle)
+			return
 		if action in self._RELATION_ASKS:
 			dlg = wx.MessageDialog(
 				# Translators: Title of a Yes/No question window.
@@ -674,7 +707,7 @@ class MainWindow(wx.Frame):
 			return
 		if self.focusTabByIdentity({"kind": "users", "key": key}):
 			return
-		params = {"kind": kind, "handle": handle, "uid": result.get("uid") or ""}
+		params = {"kind": kind, "handle": handle, "uid": result.get("uid") or "", "query": handle}
 		name = users_tab_name(kind, handle)
 		panel = UsersTab(self.notebook, self._plugin, params, rows, name, origin_key=origin)
 		store = self._plugin.store
@@ -781,6 +814,56 @@ class MainWindow(wx.Frame):
 		self.addTab(panel, panel.TAB_NAME, select=True, removable=True)
 		self._persist_tab_order()
 
+	# ------------------------------------------------------------ the New button, chats
+
+	def new_item(self):
+		"""The New button and its key: a new tweet, or what the tab in front makes (a new chat in the Chat tab)."""
+		index = self.notebook.GetSelection()
+		make = getattr(self.notebook.GetPage(index), "on_new", None) if index != wx.NOT_FOUND else None
+		if callable(make):
+			make()
+		else:
+			self._plugin.open_compose()
+
+	def _update_new_button(self):
+		"""The button says what it will make in the tab in front."""
+		if not hasattr(self, "_new_label"):
+			self._new_label = next(text for button, text, _action in self._button_labels if button is self.newButton)
+		index = self.notebook.GetSelection()
+		text = (getattr(self.notebook.GetPage(index), "NEW_LABEL", None) if index != wx.NOT_FOUND else None) or self._new_label
+		self._button_labels = [(b, text if b is self.newButton else t, a) for b, t, a in self._button_labels]
+		self.refresh_labels()
+
+	def start_chat(self, handle, uid=""):
+		"""Start chat of the user menu: the New chat window opens in the Chat tab with the user already picked."""
+		chat = next((p for p in self.getOpenTabs() if getattr(p, "TAB_KEY", None) == "chat"), None)
+		if chat is None:
+			# Translators: Announced when Start chat is used and the Chat tab is switched off.
+			announce_now(_("The Chat tab is switched off. Switch it on in Settings > Display (it is experimental)."))
+			return
+		if uid:
+			self._open_new_chat(chat, handle, uid)
+			return
+		job = lambda result: self._chat_user_found(chat, handle, result)
+		if not self._plugin.start_job("relation", job, {"handle": handle, "uid": ""}):
+			announce_now(_("Still loading, please wait."))
+			return
+		announce_now(_("Loading, please wait."))
+
+	@safe_ui
+	def _chat_user_found(self, chat, handle, result):
+		if not result["ok"]:
+			soundpack.play("error")
+			announce_now(result["message"])
+			return
+		if result.get("account_id") != self._plugin.account_id():
+			return  # the account was switched meanwhile
+		self._open_new_chat(chat, handle, result["uid"])
+
+	def _open_new_chat(self, chat, handle, uid):
+		self.focusTabByIdentity({"kind": "permanent", "key": "chat"})
+		wx.CallAfter(chat.on_new, [{"id": uid, "handle": handle, "name": ""}])
+
 	# ------------------------------------------------------------ accounts
 
 	def show_accounts_menu(self):
@@ -802,7 +885,7 @@ class MainWindow(wx.Frame):
 		"""(action id, what it does) of the main window; the keys come from the Shortcuts page."""
 		return (
 			("remove_tab", self.removeCurrentTab), ("settings", self._plugin.open_settings),
-			("search", self.search), ("new_tweet", self._plugin.open_compose),
+			("search", self.search), ("new_tweet", self.new_item),
 			("rename_tab", self.renameCurrentTab), ("check_all", self.checkAllOpenTabs),
 			("check_updates", self.onCheckForUpdates),  # for when focus is outside a tab; tabs handle it themselves
 			("move_tab_left", lambda: self.moveCurrentTab(-1)), ("move_tab_right", lambda: self.moveCurrentTab(1)),
@@ -812,6 +895,10 @@ class MainWindow(wx.Frame):
 	def onCharHook(self, evt):
 		key = evt.GetKeyCode()
 		if keymap.matches(evt, "close_window"):
+			index = self.notebook.GetSelection()
+			keep = getattr(self.notebook.GetPage(index), "on_escape", None) if index != wx.NOT_FOUND else None
+			if callable(keep) and keep():
+				return  # the tab used the key: a half written message is not lost with the window
 			self.Close()
 			return
 		if evt.ControlDown() and not evt.ShiftDown() and ord("1") <= key <= ord("9"):

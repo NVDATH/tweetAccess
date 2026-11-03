@@ -10,6 +10,8 @@ import wx
 from logHandler import log
 
 from . import keymap, soundpack, tabstate
+from .chat import ChatTab
+from .explore import ExploreTab
 from .feedlist import TweetPanel
 from .userstab import PeopleTab, UsersTab
 from .utils import (
@@ -36,6 +38,7 @@ class HomePanel(TweetPanel):
 
 	TAB_KEY = "home"
 	CAN_OLDER = True
+	VIRTUAL = True  # the list holds no rows (feedlist.VirtualList); False goes back to the normal list
 
 	def __init__(self, parent, plugin):
 		super().__init__(parent, plugin)
@@ -669,6 +672,17 @@ class UserTab(FeedTab):
 class SearchTab(FeedTab):
 	SOURCE = "search"
 
+	def __init__(self, *args, **kwargs):
+		super().__init__(*args, **kwargs)
+		# Translators: Button of a search tab that opens the search form with this search, to change it. The shortcut is added after the label.
+		self.edit_btn = wx.Button(self, label=keymap.with_key(_("Edit &search..."), "edit_search"))
+		self._buttons.Add(self.edit_btn, 0, wx.LEFT, 8)
+		self.edit_btn.Bind(wx.EVT_BUTTON, lambda e: self.edit_search())
+		self.Layout()
+
+	def edit_search(self):
+		self.GetTopLevelParent().edit_search(self._params)
+
 
 class ListTab(FeedTab):
 	SOURCE = "list"
@@ -842,10 +856,12 @@ def _cached(plugin, key):
 OPTIONAL_TABS = (
 	("notifications", lambda parent, plugin: NotificationsTab(
 		parent, plugin, {}, _cached(plugin, "notifications"), "notifications", _("Notifications"))),
+	("explore", lambda parent, plugin: ExploreTab(parent, plugin)),  # not in the Settings list: always shown
+	("chat", lambda parent, plugin: ChatTab(parent, plugin)),
+	("people", lambda parent, plugin: PeopleTab(parent, plugin)),
 	("bookmarks", lambda parent, plugin: BookmarksTab(
 		parent, plugin, {}, _cached(plugin, "bookmarks"), "bookmarks", _("Bookmarks"))),
 	("lists", lambda parent, plugin: ListsPanel(parent, plugin)),
-	("people", lambda parent, plugin: PeopleTab(parent, plugin)),
 )
 
 

@@ -721,6 +721,9 @@ def users_tab_name(kind, handle):
 	if kind == "known_followers":
 		# Translators: Name of a tab with the followers of a user that you follow too. {user} is the user name.
 		return _("Followers you know of @{user}").format(user=handle)
+	if kind == "search":
+		# Translators: Name of a tab with the users a search found. {query} is the search text.
+		return _("People: {query}").format(query=handle)
 	# Translators: Name of a tab with the followers of a user. {user} is the user name.
 	return _("Followers of @{user}").format(user=handle)
 

@@ -41,6 +41,7 @@ _DEFS = [
 	("user_followers", "", "tab", False),
 	("user_following", "", "tab", False),
 	("user_known_followers", "", "tab", False),
+	("user_message", "", "tab", False),
 	("user_follow", "", "tab", False),
 	("user_mute", "", "tab", False),
 	("user_block", "", "tab", False),
@@ -61,6 +62,7 @@ _DEFS = [
 	("copy_link", "", "tab", False),
 	("select_all", "ctrl+a", "tab", False),
 	("jump_row", "ctrl+j", "tab", False),
+	("edit_search", "ctrl+shift+f", "tab", False),
 	("clear_cache", "ctrl+delete", "tab", False),
 	("mark_read", "", "tab", False),
 	("mark_unread", "", "tab", False),
@@ -352,9 +354,9 @@ def label(action_id):
 			# Translators: Shortcut action name.
 			"check_all": _("Check all open tabs for updates"),
 			# Translators: Shortcut action name.
-			"search": _("Search"),
+			"search": _("Go to the search field (Search and explore tab)"),
 			# Translators: Shortcut action name.
-			"new_tweet": _("New tweet"),
+			"new_tweet": _("New tweet (New chat in the Chat tab)"),
 			# Translators: Shortcut action name.
 			"settings": _("Open settings"),
 			# Translators: Shortcut action name.
@@ -399,6 +401,8 @@ def label(action_id):
 			"user_following": _("View who the user follows"),
 			# Translators: Shortcut action name.
 			"user_known_followers": _("View followers of the user that you know"),
+			# Translators: Shortcut action name.
+			"user_message": _("Start a chat with the user"),
 			# Translators: Shortcut action name. The state is checked first: it follows or unfollows.
 			"user_follow": _("Follow or unfollow the user"),
 			# Translators: Shortcut action name. The state is checked first: it mutes or unmutes.
@@ -439,6 +443,8 @@ def label(action_id):
 			"select_all": _("Select all tweets"),
 			# Translators: Shortcut action name.
 			"jump_row": _("Jump to a row number"),
+			# Translators: Shortcut action name. It works in the tab of a search.
+			"edit_search": _("Edit this search"),
 			# Translators: Shortcut action name.
 			"clear_cache": _("Clear the cache of this tab"),
 			# Translators: Shortcut action name.
@@ -458,7 +464,7 @@ def label(action_id):
 			# Translators: Shortcut action name.
 			"download": _("Download media"),
 			# Translators: Shortcut action name.
-			"send_tweet": _("Post the tweet"),
+			"send_tweet": _("Post the tweet or send the message"),
 			# Translators: Shortcut action name.
 			"close_compose": _("Close the new tweet window"),
 			# Translators: Shortcut action name.

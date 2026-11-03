@@ -153,6 +153,21 @@ CREATE TABLE IF NOT EXISTS relations (
 	blocking    INTEGER,
 	PRIMARY KEY (account_id, handle)
 );
+CREATE TABLE IF NOT EXISTS dm_convos (
+	account_id INTEGER NOT NULL,
+	convo_id   TEXT    NOT NULL,
+	sort_id    INTEGER NOT NULL DEFAULT 0,
+	body       TEXT    NOT NULL,
+	PRIMARY KEY (account_id, convo_id)
+);
+CREATE TABLE IF NOT EXISTS dm_messages (
+	account_id INTEGER NOT NULL,
+	convo_id   TEXT    NOT NULL,
+	id         INTEGER NOT NULL,
+	is_read    INTEGER NOT NULL DEFAULT 0,
+	body       TEXT    NOT NULL,
+	PRIMARY KEY (account_id, convo_id, id)
+);
 """
 
 # Columns added after the first multi-account release; older databases get them in _add_columns.
@@ -566,6 +581,84 @@ class _DB:
 				state[flag] = False if self.get_meta(_skey("rel_full:" + flag, account_id)) else None
 		return state
 
+	# ---- direct messages (the Chat tab): kept as JSON, with the sort id and the read mark beside
+
+	def dm_save_convos(self, account_id, convos):
+		with self._lock:
+			self._conn.executemany(
+				"INSERT INTO dm_convos (account_id, convo_id, sort_id, body) VALUES (?, ?, ?, ?) "
+				"ON CONFLICT(account_id, convo_id) DO UPDATE SET sort_id = excluded.sort_id, body = excluded.body",
+				[(account_id, c["convo_id"], int(c.get("sort_id") or 0), json.dumps(c)) for c in convos],
+			)
+			self._conn.commit()
+
+	def dm_load_convos(self, account_id):
+		with self._lock:
+			rows = self._conn.execute(
+				"SELECT body FROM dm_convos WHERE account_id = ? ORDER BY sort_id DESC", (account_id,)
+			).fetchall()
+		return [json.loads(r[0]) for r in rows]
+
+	def dm_add_messages(self, account_id, convo_id, messages):
+		"""A message already stored keeps its read mark; a new one takes is_read from its dict."""
+		with self._lock:
+			self._conn.executemany(
+				"INSERT INTO dm_messages (account_id, convo_id, id, is_read, body) VALUES (?, ?, ?, ?, ?) "
+				"ON CONFLICT(account_id, convo_id, id) DO UPDATE SET body = excluded.body",
+				[(account_id, convo_id, int(m["id"]), int(bool(m.get("is_read"))), json.dumps(m)) for m in messages],
+			)
+			self._conn.commit()
+
+	def dm_load_messages(self, account_id, convo_id):
+		with self._lock:
+			rows = self._conn.execute(
+				"SELECT is_read, body FROM dm_messages WHERE account_id = ? AND convo_id = ? ORDER BY id",
+				(account_id, convo_id),
+			).fetchall()
+		messages = []
+		for is_read, body in rows:
+			message = json.loads(body)
+			message["is_read"] = bool(is_read)
+			messages.append(message)
+		return messages
+
+	def dm_mark_read(self, account_id, convo_id, ids, read=True):
+		with self._lock:
+			self._conn.executemany(
+				"UPDATE dm_messages SET is_read = ? WHERE account_id = ? AND convo_id = ? AND id = ?",
+				[(int(read), account_id, convo_id, int(i)) for i in ids],
+			)
+			self._conn.commit()
+
+	def dm_unread_counts(self, account_id):
+		with self._lock:
+			rows = self._conn.execute(
+				"SELECT convo_id, COUNT(*) FROM dm_messages WHERE account_id = ? AND is_read = 0 GROUP BY convo_id",
+				(account_id,),
+			).fetchall()
+		return {r[0]: r[1] for r in rows}
+
+	def dm_newest_ids(self, account_id):
+		with self._lock:
+			rows = self._conn.execute(
+				"SELECT convo_id, MAX(id) FROM dm_messages WHERE account_id = ? GROUP BY convo_id", (account_id,)
+			).fetchall()
+		return {r[0]: r[1] for r in rows}
+
+	def dm_delete_message(self, account_id, convo_id, message_id):
+		with self._lock:
+			self._conn.execute(
+				"DELETE FROM dm_messages WHERE account_id = ? AND convo_id = ? AND id = ?",
+				(account_id, convo_id, int(message_id)),
+			)
+			self._conn.commit()
+
+	def dm_delete_convo(self, account_id, convo_id):
+		with self._lock:
+			self._conn.execute("DELETE FROM dm_messages WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
+			self._conn.execute("DELETE FROM dm_convos WHERE account_id = ? AND convo_id = ?", (account_id, convo_id))
+			self._conn.commit()
+
 	def clear_posts(self, account_id):
 		with self._lock:
 			self._conn.execute("DELETE FROM tweets WHERE account_id = ?", (account_id,))
@@ -724,6 +817,33 @@ class Store:
 	def relation_state(self, account_id, handle):
 		return self._db(account_id).relation_state(account_id, handle)
 
+	def dm_save_convos(self, account_id, convos):
+		self._db(account_id).dm_save_convos(account_id, convos)
+
+	def dm_load_convos(self, account_id):
+		return self._db(account_id).dm_load_convos(account_id)
+
+	def dm_add_messages(self, account_id, convo_id, messages):
+		self._db(account_id).dm_add_messages(account_id, convo_id, messages)
+
+	def dm_load_messages(self, account_id, convo_id):
+		return self._db(account_id).dm_load_messages(account_id, convo_id)
+
+	def dm_mark_read(self, account_id, convo_id, ids, read=True):
+		self._db(account_id).dm_mark_read(account_id, convo_id, ids, read)
+
+	def dm_unread_counts(self, account_id):
+		return self._db(account_id).dm_unread_counts(account_id)
+
+	def dm_newest_ids(self, account_id):
+		return self._db(account_id).dm_newest_ids(account_id)
+
+	def dm_delete_message(self, account_id, convo_id, message_id):
+		self._db(account_id).dm_delete_message(account_id, convo_id, message_id)
+
+	def dm_delete_convo(self, account_id, convo_id):
+		self._db(account_id).dm_delete_convo(account_id, convo_id)
+
 	def clear_posts(self, account_id):
 		self._db(account_id).clear_posts(account_id)
 
@@ -752,6 +872,8 @@ class MemoryStore:
 		self._next_id = 1
 		self._tweets = {}     # account id -> {tweet id: Post}
 		self._relations = {}  # account id -> {handle: {"uid", and the flags that are known}}
+		self._dm_convos = {}  # account id -> {convo id: dict}
+		self._dm_messages = {}  # account id -> {convo id: {message id: dict}}
 		self._meta = {}
 
 	@staticmethod
@@ -809,6 +931,8 @@ class MemoryStore:
 				del self._meta[key]
 			self._tweets.pop(account_id, None)
 			self._relations.pop(account_id, None)
+			self._dm_convos.pop(account_id, None)
+			self._dm_messages.pop(account_id, None)
 			self._meta.pop(_skey(CURSOR_KEY, account_id), None)
 			self._meta.pop(_skey(FOCUS_KEY, account_id), None)
 
@@ -917,6 +1041,62 @@ class MemoryStore:
 			else:
 				state[flag] = False if self.get_account_meta(account_id, "rel_full:" + flag) else None
 		return state
+
+	def dm_save_convos(self, account_id, convos):
+		with self._lock:
+			table = self._dm_convos.setdefault(account_id, {})
+			for c in convos:
+				table[c["convo_id"]] = copy.deepcopy(c)
+
+	def dm_load_convos(self, account_id):
+		with self._lock:
+			rows = sorted(
+				self._dm_convos.get(account_id, {}).values(), key=lambda c: int(c.get("sort_id") or 0), reverse=True
+			)
+			return copy.deepcopy(rows)
+
+	def dm_add_messages(self, account_id, convo_id, messages):
+		with self._lock:
+			table = self._dm_messages.setdefault(account_id, {}).setdefault(convo_id, {})
+			for m in messages:
+				old = table.get(int(m["id"]))
+				new = copy.deepcopy(m)
+				new["is_read"] = old["is_read"] if old is not None else bool(m.get("is_read"))
+				table[int(m["id"])] = new
+
+	def dm_load_messages(self, account_id, convo_id):
+		with self._lock:
+			table = self._dm_messages.get(account_id, {}).get(convo_id, {})
+			return [copy.deepcopy(table[i]) for i in sorted(table)]
+
+	def dm_mark_read(self, account_id, convo_id, ids, read=True):
+		with self._lock:
+			table = self._dm_messages.get(account_id, {}).get(convo_id, {})
+			for i in ids:
+				if int(i) in table:
+					table[int(i)]["is_read"] = bool(read)
+
+	def dm_unread_counts(self, account_id):
+		with self._lock:
+			counts = {}
+			for convo_id, table in self._dm_messages.get(account_id, {}).items():
+				unread = sum(1 for m in table.values() if not m["is_read"])
+				if unread:
+					counts[convo_id] = unread
+			return counts
+
+	def dm_newest_ids(self, account_id):
+		with self._lock:
+			return {cid: max(table) for cid, table in self._dm_messages.get(account_id, {}).items() if table}
+
+	def dm_delete_message(self, account_id, convo_id, message_id):
+		with self._lock:
+			self._dm_messages.get(account_id, {}).get(convo_id, {}).pop(int(message_id), None)
+
+	def dm_delete_convo(self, account_id, convo_id):
+		with self._lock:
+			self._dm_messages.get(account_id, {}).pop(convo_id, None)
+			self._dm_convos.get(account_id, {}).pop(convo_id, None)
 
 	def clear_posts(self, account_id):
 		with self._lock:

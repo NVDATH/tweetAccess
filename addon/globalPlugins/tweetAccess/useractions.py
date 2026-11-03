@@ -13,7 +13,7 @@ addonHandler.initTranslation()
 # The entries of the user menu that have a shortcut of their own on the Shortcuts page (see populate_user_menu).
 USER_ACTIONS = (
 	"user_timeline", "user_info", "user_pinned", "user_followers", "user_following", "user_known_followers",
-	"user_follow", "user_mute", "user_block", "user_copy_url", "user_open_web",
+	"user_follow", "user_mute", "user_block", "user_message", "user_copy_url", "user_open_web",
 )
 # Enter key action (Settings > General) -> the user action it runs, in a list of users too.
 ENTER_USER_ACTIONS = {
@@ -52,7 +52,7 @@ def populate_user_menu(menu, window, run, state=None):
 	relations = (
 		# Translators: Entries of the user menu: the first label when the relation is on now, the second when it is off, so each one says what it will do. The shortcut is added after the label.
 		("following", "user_follow", _("Un&follow"), _("&Follow")),
-		("muting", "user_mute", _("Un&mute"), _("Mu&te")),
+		("muting", "user_mute", _("Un&mute"), _("&Mute")),
 		("blocking", "user_block", _("Un&block"), _("&Block")),
 	)
 	known = [r for r in relations if (state or {}).get(r[0]) is not None]
@@ -60,6 +60,8 @@ def populate_user_menu(menu, window, run, state=None):
 		add(menu, undo_label if state[flag] else label, action_id)
 	if known:
 		menu.AppendSeparator()
+	# Translators: Entry of the user menu that starts a chat. It has no access key on purpose: a key pressed by mistake would open the New chat window.
+	add(menu, _("Start chat..."), "user_message")
 	copy_menu = wx.Menu()
 	# Translators: Entry of the Copy submenu of the user menu.
 	add(copy_menu, _("Copy &profile URL"), "user_copy_url")

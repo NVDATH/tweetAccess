@@ -16,6 +16,7 @@ DEFAULTS = {
 	"bg_interval": 15,              # Home: minutes between background checks, 0 = off
 	"bg_interval_notifications": 15,
 	"bg_interval_bookmarks": 0,
+	"bg_interval_trends": 0,        # Search and explore: minutes between background loads of the trends shown last
 	"bg_interval_tabs": 0,          # open tabs: minutes for a tab with no setting of its own
 	"bg_tab_settings": "",          # JSON {"<type>:<key>": [minutes, speak]} for open tabs that differ from that default
 	"bg_announce_off": "",          # comma separated categories (home, notifications, tabs) that are checked silently
@@ -28,7 +29,7 @@ DEFAULTS = {
 	"tray_tabs": "",                # JSON list of the tabs (besides Home, Notifications) the tray icon counts
 	"show_tray": True,              # notification area icon with the unread count
 	"embed_first": True,            # Embed column first (otherwise last)
-	"tabs_off": "",                 # comma separated optional tabs that are switched off
+	"tabs_off": "chat",             # comma separated optional tabs that are switched off (Chat is experimental)
 	"search_filter_order": "",      # advanced search, Include list: filter keys comma separated, in the user's order
 	"search_omit_order": "",        # advanced search, Leave out list: same, in its own order
 	"tray_disabled": "",            # comma separated tabs NOT counted by the tray icon
@@ -42,6 +43,7 @@ RANGES = {
 	"bg_interval": (0, 60),
 	"bg_interval_notifications": (0, 60),
 	"bg_interval_bookmarks": (0, 60),
+	"bg_interval_trends": (0, 60),
 	"bg_interval_tabs": (0, 60),
 	"auto_pause": (1, 10),
 	"feed_pages": (1, 5),

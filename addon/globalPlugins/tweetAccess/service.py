@@ -14,10 +14,14 @@ import asyncio
 import html
 import inspect
 import json
+import os
 import queue
 import random
 import re
+import tempfile
 import threading
+import time
+import urllib.parse
 from types import SimpleNamespace
 
 import addonHandler
@@ -25,7 +29,7 @@ from logHandler import log
 
 from .utils import (
 	CURSOR_KEY, FETCH_COUNT, IMPERSONATE, TAG, USE_IMPERSONATE,
-	Post, hashed_uid, isolated_modules, login_needed_text, notification_id, set_stat, user_id_from_twid,
+	Post, handle_of, hashed_uid, isolated_modules, login_needed_text, notification_id, set_stat, user_id_from_twid,
 )
 
 addonHandler.initTranslation()
@@ -303,6 +307,14 @@ _PRIVATE_USE = re.compile("[\ue000-\uf8ff]")  # icon glyphs X puts in names (ver
 def notification_to_post(n, index=0):
 	"""A notification as a row: the author is who did it, the message says what and on which tweet."""
 	user, tw = _val(n, "from_user"), _val(n, "tweet")
+	icon = _val(n, "icon")
+	if tw is not None and isinstance(icon, dict) and icon.get("id") == "tweet_entry":
+		# A reply, a quote or a mention that X puts among the notifications: the row is the tweet itself (with
+		# its reply / quote context), placed by the time it was written like the other notifications.
+		post = tweet_to_post(tw)
+		stamp = (int(post.url.rstrip("/").rsplit("/", 1)[-1]) >> 22) + 1288834974657 if post.url else post.ts * 1000
+		post.id = notification_id(stamp, handle_of(post.author), post.url)
+		return post
 	text = _PRIVATE_USE.sub("", str(_val(n, "message") or "")).strip()
 	name = _PRIVATE_USE.sub("", str(_val(user, "name") or "")).strip()
 	if name and text.startswith(name):
@@ -325,6 +337,144 @@ def notification_to_post(n, index=0):
 	)
 
 
+IMAGE_SHRINK_TARGET = 4_500_000  # bytes: a shrunk image aims below X's 5 MB with some room
+
+
+def shrink_image(path, limit):
+	"""A JPEG copy of an image that fits under limit bytes (the Pillow of NVDA), in a temp file the caller
+	deletes. The EXIF turn is applied, transparency is flattened onto white. Raises if it cannot get small enough."""
+	from PIL import Image, ImageOps
+	with Image.open(path) as source:
+		image = ImageOps.exif_transpose(source).convert("RGBA")
+	flat = Image.new("RGB", image.size, (255, 255, 255))
+	flat.paste(image, mask=image.getchannel("A"))
+	fd, target = tempfile.mkstemp(suffix=".jpg")
+	os.close(fd)
+	try:
+		scale = 1.0
+		for _round in range(8):
+			size = (max(1, int(flat.width * scale)), max(1, int(flat.height * scale)))
+			picture = flat if scale == 1.0 else flat.resize(size, Image.Resampling.LANCZOS)
+			for quality in (90, 80, 70):
+				picture.save(target, "JPEG", quality=quality)
+				if os.path.getsize(target) <= limit:
+					return target
+			scale *= 0.75
+	except Exception:
+		os.remove(target)
+		raise
+	os.remove(target)
+	raise ValueError("could not shrink the image under %d bytes" % limit)
+
+
+def dm_time(value):
+	"""Seconds since 1970 of the time X gives a direct message (milliseconds, in a string)."""
+	try:
+		number = int(value)
+	except (TypeError, ValueError):
+		return 0
+	return number // 1000 if number > 10 ** 11 else number
+
+
+def dm_users(users):
+	"""id -> {"handle", "name"} from the users X sends along with conversations and messages."""
+	out = {}
+	for key, user in (users or {}).items():
+		if isinstance(user, dict):
+			out[str(user.get("id_str") or user.get("id") or key)] = {
+				"handle": str(user.get("screen_name") or ""),
+				"name": _PRIVATE_USE.sub("", str(user.get("name") or "")).strip(),
+			}
+	return out
+
+
+_DM_ATTACHMENT_KINDS = {"photo": "image", "video": "video", "animated_gif": "gif", "tweet": "tweet"}
+
+
+def _dm_media_url(kind, inner):
+	"""What to download for an attachment: the picture, or the best mp4 of a video or GIF."""
+	if kind in ("video", "animated_gif"):
+		best = None
+		for variant in ((inner.get("video_info") or {}).get("variants") or []):
+			url = variant.get("url") if isinstance(variant, dict) else None
+			if isinstance(url, str) and ".mp4" in url:
+				bitrate = _int(variant.get("bitrate")) or 0
+				if best is None or bitrate > best[0]:
+					best = (bitrate, url)
+		if best:
+			return best[1]
+	return str(inner.get("media_url_https") or inner.get("media_url") or "")
+
+
+def dm_message_row(data, own, read_id=0, older=False):
+	"""A message of a conversation as a dict for the cache. own: the id of this account; read_id: how far X says
+	this account has read; older: the message is older than rows already shown, so it counts as read."""
+	text = str(data.get("text") or "")
+	for link in ((data.get("entities") or {}).get("urls") or []):
+		if isinstance(link, dict) and link.get("url") and link.get("expanded_url"):
+			text = text.replace(link["url"], link["expanded_url"])
+	attachment = None
+	raw = data.get("attachment")
+	if isinstance(raw, dict) and raw:
+		name, inner = next(iter(raw.items()))
+		inner = inner if isinstance(inner, dict) else {}
+		if inner.get("url"):
+			text = text.replace(str(inner["url"]), "")  # the link X puts in the text for the attachment
+		attachment = {
+			"kind": _DM_ATTACHMENT_KINDS.get(name, str(name)), "url": _dm_media_url(name, inner),
+			"link": str(inner.get("expanded_url") or ""),
+		}
+	reply = data.get("reply_data")
+	message_id, sender = int(data["id"]), str(data.get("sender_id") or "")
+	return {
+		"id": message_id, "sender_id": sender, "ts": dm_time(data.get("time")),
+		"text": re.sub(r"[ \t]{2,}", " ", html.unescape(text)).strip(),
+		"reply": {
+			"id": str(reply.get("id") or ""), "text": str(reply.get("text") or ""),
+			"sender_id": str(reply.get("sender_id") or ""),
+		} if isinstance(reply, dict) else None,
+		"attachment": attachment,
+		"is_read": bool(older or sender == own or message_id <= read_id),
+	}
+
+
+def dm_convo_row(conv, users, own):
+	"""A conversation of the inbox as a dict for the cache. users: dm_users(). Members are everyone but this
+	account; a one-to-one conversation has its partner's id."""
+	people = [str(p.get("user_id")) for p in conv.get("participants") or [] if isinstance(p, dict)]
+	is_group = "GROUP" in str(conv.get("type") or "").upper() or bool(conv.get("created_by_user_id"))
+	members = [
+		{"id": uid, "handle": users.get(uid, {}).get("handle", ""), "name": users.get(uid, {}).get("name", "")}
+		for uid in people if uid != own
+	]
+	return {
+		"convo_id": str(conv["conversation_id"]), "is_group": is_group, "name": str(conv.get("name") or ""),
+		"partner_id": "" if is_group else (members[0]["id"] if members else own), "members": members,
+		"trusted": bool(conv.get("trusted")), "muted": bool(conv.get("muted")),
+		"sort_id": _int(conv.get("sort_timestamp")) or _int(conv.get("sort_event_id")) or 0,
+		"read_id": _int(conv.get("last_read_event_id")) or 0,
+		"last_id": _int(conv.get("sort_event_id")) or 0,  # the newest event: a message, a reaction, a change...
+		"low_quality": bool(conv.get("low_quality")), "nsfw": bool(conv.get("nsfw")),
+	}
+
+
+def dm_inbox_state(response):
+	"""(conversations, users, status, next max_id) of one page of the inbox, in either shape X sends: the first
+	page (inbox_initial_state, with the timelines inside it) or a later one (inbox_timeline, the timeline itself)."""
+	timeline = response.get("inbox_timeline")
+	if isinstance(timeline, dict):
+		return (
+			dict(timeline.get("conversations") or {}), dm_users(timeline.get("users")),
+			timeline.get("status"), timeline.get("min_entry_id"),
+		)
+	state = response.get("inbox_initial_state") or response.get("user_events") or {}
+	trusted = (state.get("inbox_timelines") or {}).get("trusted") or {}
+	return (
+		dict(state.get("conversations") or {}), dm_users(state.get("users")),
+		trusted.get("status"), trusted.get("min_entry_id"),
+	)
+
+
 def describe_error(exc):
 	"""A short sentence for the user. Details go to the log."""
 	name = type(exc).__name__
@@ -339,7 +489,7 @@ def describe_error(exc):
 	if name in ("RequestTimeout", "ConnectTimeout", "ReadTimeout", "ConnectError"):
 		return _("The connection to X timed out.")
 	if name == "NotFound":
-		return _("X says this address does not exist. X may have changed or removed this feature.")
+		return _("X answered \"not found\", which can pass by itself. Try again; if it keeps happening, restart NVDA.")
 	return _("The request failed (%s). See the NVDA log.") % name
 
 
@@ -366,6 +516,7 @@ class FetchService:
 		self._pending = 0  # jobs submitted and not finished: the one running, and at most one that waits
 		self._bg_running = False  # the running job is a background check: a reader's request may queue behind it
 		self._clients = {}  # account id -> its twikit client, so accounts that take turns keep theirs
+		self._client_born = {}  # account id -> when its client was made
 		self._chains = {}  # (account, tab key) -> last result page of a remote feed, for "older"
 		self._job_account = None  # account of the job that runs: what its pages tell about their authors is kept for it
 		self._worker_thread = threading.Thread(target=self._run, name="NVTweetWorker", daemon=True)
@@ -380,8 +531,10 @@ class FetchService:
 		"""Forget the client of one account (new cookies, or X rejected the session), or of all."""
 		if account_id is None:
 			self._clients.clear()
+			self._client_born.clear()
 		else:
 			self._clients.pop(account_id, None)
+			self._client_born.pop(account_id, None)
 
 	@property
 	def busy(self):
@@ -411,7 +564,7 @@ class FetchService:
 			kind, callback, options, background = job
 			try:
 				with isolated_modules():
-					result = loop.run_until_complete(self._do(kind, options))
+					result = loop.run_until_complete(self._attempt(kind, options))
 			except Exception as e:
 				log.error(TAG + "%s failed (%s)" % (kind, type(e).__name__), exc_info=True)
 				if type(e).__name__ in ("Unauthorized", "Forbidden", "InvalidSession") or isinstance(e, CookieError):
@@ -435,6 +588,18 @@ class FetchService:
 		except Exception:
 			pass
 
+	async def _attempt(self, kind, options):
+		"""Run a job. A 404 is tried once more with a new client: X enforces x-client-transaction-id on some
+		operations only, and a client whose keys went stale gets 404 for those (see twikit.errors)."""
+		try:
+			return await self._do(kind, options)
+		except Exception as e:
+			if type(e).__name__ != "NotFound" or options.get("account_id") is None:
+				raise
+			log.info(TAG + "%s got a 404: trying once more with a new client" % kind)
+			self.reset_client(options["account_id"])
+			return await self._do(kind, options)
+
 	@staticmethod
 	def _make_client(cookies):
 		"""Must run inside isolated_modules()."""
@@ -450,15 +615,18 @@ class FetchService:
 		client.set_cookies(cookies)
 		return client
 
+	CLIENT_MAX_AGE = 6 * 3600  # seconds a client is kept: the keys of its x-client-transaction-id go stale in days
+
 	def _get_client(self, account_id):
 		client = self._clients.get(account_id)
-		if client is not None:
+		if client is not None and time.time() - self._client_born.get(account_id, 0) < self.CLIENT_MAX_AGE:
 			return client
 		cookies = self.store.get_cookies(account_id)
 		if cookies is None:
 			raise CookieError("no cookies for this account")
 		client = self._make_client(cookies)
 		self._clients[account_id] = client
+		self._client_born[account_id] = time.time()
 		return client
 
 	async def _do(self, kind, options):
@@ -487,8 +655,24 @@ class FetchService:
 			return await self._users(client, account_id, options)
 		if kind == "relation":
 			return await self._relation(client, account_id, options)
+		if kind == "trends":
+			return await self._trends(client, account_id, options)
+		if kind == "places":
+			return await self._places(client, account_id, options)
 		if kind == "feed":
 			return await self._feed(client, account_id, options)
+		if kind == "dm_inbox":
+			return await self._dm_inbox(client, account_id, options)
+		if kind == "dm_history":
+			return await self._dm_history(client, account_id, options)
+		if kind == "dm_send":
+			return await self._dm_send(client, account_id, options)
+		if kind == "dm_delete":
+			return await self._dm_delete(client, account_id, options)
+		if kind == "dm_delete_convo":
+			return await self._dm_delete_convo(client, account_id, options)
+		if kind == "dm_start":
+			return await self._dm_start(client, account_id, options)
 		if kind == "lists":
 			return await self._lists(client, account_id, options)
 		if kind == "post":
@@ -894,12 +1078,68 @@ class FetchService:
 	async def _pause(cls):
 		await asyncio.sleep(random.uniform(*cls.PAGE_DELAY))
 
+	class _NotificationPage(list):
+		"""One page of the notification list as twifork's Notification objects, and the way to the next page."""
+
+		def __init__(self, items, fetch_next=None):
+			super().__init__(items)
+			self._fetch_next = fetch_next
+
+		def next(self):
+			return self._fetch_next() if self._fetch_next else None
+
+	@staticmethod
+	async def _notifications_page(client, cursor):
+		"""A page of the notification list. twifork turns only the notifications X groups ("liked your post",
+		"retweeted", "followed you") into objects and leaves out the tweets X puts among them: the replies, quotes
+		and mentions, also from people the account does not follow. Those are read here too, from the same page."""
+		from twikit.notification import Notification
+		from twikit.tweet import Tweet
+		from twikit.user import User
+		from twikit.utils import build_tweet_data, build_user_data, first_dict
+		response, _headers = await client.v11.notifications_all(FETCH_COUNT, cursor)
+		objects = response.get("globalObjects") or {}
+		users = {i: User(client, build_user_data(d)) for i, d in (objects.get("users") or {}).items()}
+		tweets = {}
+		for tweet_id, data in (objects.get("tweets") or {}).items():
+			user = users.get(data.get("user_id_str"))
+			if user is not None:
+				built = build_tweet_data(data)
+				for key in ("in_reply_to_screen_name", "user_id_str", "conversation_id_str", "retweeted"):
+					if key in data:
+						built["legacy"].setdefault(key, data[key])  # twifork keeps these out; the reply context needs them
+				tweets[tweet_id] = Tweet(client, built, user)
+		items = []
+		for data in (objects.get("notifications") or {}).values():
+			actions = (data.get("template") or {}).get("aggregateUserActionsV1") or {}
+			targets, senders = actions.get("targetObjects") or [], actions.get("fromUsers") or []
+			tweet = tweets.get(targets[0]["tweet"]["id"]) if targets and "tweet" in targets[0] else None
+			sender = users.get(senders[0]["user"]["id"]) if senders and "user" in senders[0] else None
+			items.append(Notification(client, data, tweet, sender))
+		entries = first_dict(response, "entries", []) or []
+		seen = set()
+		for entry in entries:
+			tweet_id = ((((entry.get("content") or {}).get("item") or {}).get("content") or {}).get("tweet") or {}).get("id")
+			tweet = tweets.get(str(tweet_id)) if tweet_id else None
+			if tweet is None or tweet.id in seen:
+				continue
+			seen.add(tweet.id)
+			data = {
+				"id": tweet.id, "timestampMs": str((int(tweet.id) >> 22) + 1288834974657),
+				"icon": {"id": "tweet_entry"}, "message": {"text": ""},
+			}
+			items.append(Notification(client, data, tweet, tweet.user))
+		bottom = [e for e in entries if str(e.get("entryId", "")).startswith("cursor-bottom")]
+		next_cursor = first_dict(bottom[0], "value") if bottom else None
+		fetch_next = (lambda: FetchService._notifications_page(client, next_cursor)) if next_cursor else None
+		return FetchService._NotificationPage(items, fetch_next)
+
 	@staticmethod
 	async def _first_page(client, source, params):
 		if source == "bookmarks":
 			return await client.get_bookmarks(count=FETCH_COUNT)
 		if source == "notifications":
-			return await client.get_notifications("All", count=FETCH_COUNT)
+			return await FetchService._notifications_page(client, None)
 		if source == "user":
 			return await client.get_user_tweets(params["uid"], "Tweets", count=FETCH_COUNT)
 		if source == "search":
@@ -1018,6 +1258,41 @@ class FetchService:
 				return _ok("feed", items, uid=params.get("uid"))
 		return _ok("feed", [], uid=params.get("uid"))
 
+	async def _trends(self, client, account_id, options):
+		"""The trends of one of the Explore categories (options["category"]) or of a place (options["woeid"]).
+		Rows: name, query (what searching for it sends) and note (context or number of tweets)."""
+		rows = []
+		if options.get("woeid"):
+			result = await client.get_place_trends(int(options["woeid"]))  # a dict: trends, as_of, locations...
+			for t in (result.get("trends") if isinstance(result, dict) else None) or []:
+				name = str(_val(t, "name") or "")
+				if not name:
+					continue
+				volume = _int(_val(t, "tweet_volume"))
+				rows.append({
+					"name": name, "query": urllib.parse.unquote_plus(str(_val(t, "query") or "")) or name,
+					"note": _("{count} tweets").format(count=volume) if volume else "",
+				})
+		else:
+			for t in await client.get_trends(options["category"], count=20):
+				name = " ".join(str(_val(t, "name") or "").split())
+				if not name:
+					continue
+				volume = _int(_val(t, "tweets_count"))
+				context = str(_val(t, "domain_context") or "")
+				note = ", ".join(p for p in (context, _("{count} tweets").format(count=volume) if volume else "") if p)
+				query = name if (name.startswith("#") or " " not in name) else '"%s"' % name.replace('"', "")
+				rows.append({"name": name, "query": query, "note": note})
+		return _ok("trends", [], trends=rows)
+
+	async def _places(self, client, account_id, options):
+		"""The places X has trends for: name, woeid (the number the trends are asked for) and country."""
+		places = [
+			{"name": str(_val(p, "name") or ""), "woeid": _int(_val(p, "woeid")), "country": str(_val(p, "country") or "")}
+			for p in await client.get_available_locations()
+		]
+		return _ok("places", [], places=[p for p in places if p["name"] and p["woeid"]])
+
 	_RELATION_CALLS = {
 		"follow": "follow_user", "unfollow": "unfollow_user", "mute": "mute_user", "unmute": "unmute_user",
 		"block": "block_user", "unblock": "unblock_user",
@@ -1074,6 +1349,7 @@ class FetchService:
 		"followers": ("get_user_followers", True), "following": ("get_user_following", True),
 		"known_followers": ("get_user_followers_you_know", True),
 		"muted": ("get_muted_users", False), "blocked": ("get_blocked_users", False),
+		"search": ("search_user", False),  # asks for the text options["params"]["query"]
 	}
 	_LIST_FLAG = {"following": "following", "muted": "muting", "blocked": "blocking"}  # lists that are a relation
 
@@ -1118,7 +1394,10 @@ class FetchService:
 		page = self._chains.get(chain) if have is not None else None
 		limited = False
 		if page is None:
-			page = await (fetch(uid, count=self.USERS_PAGE) if needs_uid else fetch())
+			if kind == "search":
+				page = await fetch(params["query"], count=self.USERS_PAGE)
+			else:
+				page = await (fetch(uid, count=self.USERS_PAGE) if needs_uid else fetch())
 			items = self._convert_users(page)
 			if have is None:
 				gathered, complete = list(items), False
@@ -1154,6 +1433,105 @@ class FetchService:
 				return _ok("users", [], users=self._record_users(account_id, items), uid=uid)
 		return _ok("users", [], users=[], uid=uid, limited=limited)
 
+	# -------------------------------------------------------------- direct messages
+	# The jobs only read from and write to X; the caller keeps the rows (store.dm_*). X has no way to mark a
+	# conversation read, so what is read is kept on this computer only.
+
+	DM_INBOX_PAGES = 6  # pages of the inbox read at most (the first one holds about 25 conversations)
+
+	async def _dm_inbox(self, client, account_id, options):
+		"""The conversations of the inbox, newest first, with the names of their members (cache rows, see
+		dm_convo_row). The requests (not trusted) are in the first page."""
+		own = str(await client.user_id())
+		response, _headers = await client.v11.dm_inbox(None)
+		convs, users, status, max_id = dm_inbox_state(response)
+		complete = False  # True when X has no older conversation than the ones read
+		limit = int(options.get("pages") or self.DM_INBOX_PAGES)
+		for page in range(limit):
+			if status == "AT_END" or not max_id:
+				complete = True
+				break
+			if page == limit - 1:
+				break
+			await self._pause()
+			response, _headers = await client.v11.dm_inbox_timeline("trusted", max_id)
+			more, more_users, status, max_id = dm_inbox_state(response)
+			if not more:
+				break  # a page with nothing in it, though X said there was more: the inbox was not read whole
+			convs.update(more)
+			users.update(more_users)
+		rows = [
+			dm_convo_row(c, users, own) for c in convs.values() if isinstance(c, dict) and c.get("conversation_id")
+		]
+		rows.sort(key=lambda r: r["sort_id"], reverse=True)
+		return _ok("dm_inbox", [], convos=rows, own=own, complete=complete)
+
+	async def _dm_history(self, client, account_id, options):
+		"""Pages of one conversation (options["pages"]), newest page first, as cache rows oldest first.
+		options: convo_id as the inbox gave it, is_group, partner_id, read_id (how far X says it was read) and
+		max_id (only messages older than it, for "load older": they count as read)."""
+		own = str(await client.user_id())
+		convo_id = options["convo_id"] if options.get("is_group") else "%s-%s" % (options["partner_id"], own)
+		max_id = options.get("max_id")
+		older = max_id is not None
+		read_id = int(options.get("read_id") or 0)
+		rows, users, more = {}, {}, False
+		for page in range(max(1, int(options.get("pages") or 1))):
+			if page:
+				await self._pause()
+			response, _headers = await client.v11.dm_conversation(convo_id, max_id)
+			timeline = response.get("conversation_timeline") or {}
+			users.update(dm_users(timeline.get("users")))
+			got = []
+			for entry in timeline.get("entries") or []:
+				data = (entry.get("message") or {}).get("message_data")
+				if isinstance(data, dict) and data.get("id"):
+					got.append(dm_message_row(data, own, read_id, older))
+			for row in got:
+				rows.setdefault(row["id"], row)
+			more = timeline.get("status") == "HAS_MORE" and bool(got)
+			if not more:
+				break
+			max_id = min(r["id"] for r in got)
+		return _ok(
+			"dm_history", [], messages=sorted(rows.values(), key=lambda r: r["id"]), users=users, more=more, own=own,
+		)
+
+	async def _dm_send(self, client, account_id, options):
+		"""A text message to a user (options["partner_id"]) or to a group (options["convo_id"] with is_group);
+		options["reply_to"]: the id of the message that is answered. Returns the sent message as a cache row."""
+		own = str(await client.user_id())
+		reply_to = str(options["reply_to"]) if options.get("reply_to") else None
+		if options.get("is_group"):
+			sent = await client.send_dm_to_group(options["convo_id"], options["text"], reply_to=reply_to)
+		else:
+			sent = await client.send_dm(str(options["partner_id"]), options["text"], reply_to=reply_to)
+		data = {
+			"id": _val(sent, "id"), "sender_id": own, "text": _val(sent, "text") or options["text"],
+			"time": _val(sent, "time"), "reply_data": _val(sent, "reply_data"),
+		}
+		return _ok("dm_send", [], message=dm_message_row(data, own))
+
+	async def _dm_delete(self, client, account_id, options):
+		"""Deletes a message for this account only: the other side keeps it."""
+		await client.delete_dm(str(options["id"]))
+		return _ok("dm_delete", [], id=int(options["id"]))
+
+	async def _dm_start(self, client, account_id, options):
+		"""The first message of a chat: to one user (options["user_ids"] has one id), or to a new group (several).
+		X does not list a conversation with nothing in it, so the text is needed either way."""
+		user_ids = [str(i) for i in options["user_ids"]]
+		if len(user_ids) == 1:
+			await client.send_dm(user_ids[0], options["text"])
+			return _ok("dm_start", [], partner_id=user_ids[0], group_id="")
+		group = await client.create_group(user_ids, options["text"])
+		return _ok("dm_start", [], partner_id="", group_id=str(_val(group, "id") or ""))
+
+	async def _dm_delete_convo(self, client, account_id, options):
+		"""Deletes a conversation for this account only: the other side keeps it."""
+		await client.delete_dm_conversation(str(options["convo_id"]))
+		return _ok("dm_delete_convo", [], convo_id=str(options["convo_id"]))
+
 	async def _lists(self, client, account_id, options):
 		lists = list(await client.get_lists(count=50))
 		items = [{"id": str(_val(l, "id")), "name": str(_val(l, "name") or "")} for l in lists if _val(l, "id")]
@@ -1168,6 +1546,29 @@ class FetchService:
 			kwargs["reply_to"] = str(options["reply_to"])
 		if options.get("quote_url"):
 			kwargs["attachment_url"] = options["quote_url"]
+		media_ids = []
+		shrunk = []  # temp copies of images made smaller, deleted after the uploads
+		try:
+			for item in options.get("media") or []:
+				if media_ids:
+					await self._pause()  # gentler on X between uploads
+				path = item["path"]
+				if item.get("shrink"):
+					path = shrink_image(path, IMAGE_SHRINK_TARGET)
+					shrunk.append(path)
+				extra = {"media_category": "tweet_gif"} if item.get("kind") == "gif" else {}  # X's upload check needs it for a GIF
+				media_id = await client.upload_media(path, wait_for_completion=True, **extra)
+				media_ids.append(media_id)
+				if item.get("alt"):
+					await client.create_media_metadata(media_id, alt_text=item["alt"])
+		finally:
+			for path in shrunk:
+				try:
+					os.remove(path)
+				except OSError:
+					pass
+		if media_ids:
+			kwargs["media_ids"] = media_ids
 		tweet = await client.create_tweet(text=options["text"], **kwargs)
 		try:
 			posts = [tweet_to_post(tweet)]

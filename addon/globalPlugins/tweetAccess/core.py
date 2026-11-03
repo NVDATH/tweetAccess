@@ -31,6 +31,7 @@ BG_TICK_MS = 60000             # how often we check whether a background update 
 BG_JITTER = 0.25               # up to +25% of the interval is added at random
 BG_KEYS = {  # the tabs every account has: the setting that holds the minutes between checks
 	"home": "bg_interval", "notifications": "bg_interval_notifications", "bookmarks": "bg_interval_bookmarks",
+	"trends": "bg_interval_trends",
 }
 STARTUP_DELAY_MS = 3000        # after NVDA starts: open the cache, show the tray icon
 STARTUP_SYNC_DELAY_MS = 15000  # after NVDA starts: load new tweets once
@@ -815,6 +816,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return self._service.submit(
 				"feed", lambda result, c=cat: self._on_bg_feed(c, result), options, background=True,
 			)
+		if cat == "trends":
+			return self._run_bg_trends(aid)
 		main = self._live_main() if aid == self.account_id() else None  # an open tab: refresh the tab itself, else its saved copy
 		if main is not None:
 			for panel in main.getOpenTabs():
@@ -831,6 +834,37 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			(e for e in tabstate.get_open_tabs(self._store, aid) if "%s:%s" % (e["type"], e["key"]) == cat), None
 		)
 		return self._bg_saved_tab(aid, entry) if entry is not None else False
+
+	def _run_bg_trends(self, aid):
+		"""Load again the trends that the Search and explore tab showed last, into their cache. Nothing is said:
+		the list is simply up to date when the reader looks."""
+		try:
+			state = json.loads(self._store.get_account_meta(aid, "explore_state") or "{}")
+			kind, value = (state.get("source") or ["category", "trending"])[:2]
+		except (ValueError, TypeError):
+			kind, value = "category", "trending"
+		options = {"account_id": aid}
+		options["woeid" if kind == "place" else "category"] = value
+		key = "%s:%s" % (kind, value)
+		return self._service.submit(
+			"trends", lambda result, k=key: self._on_bg_trends(k, result), options, background=True,
+		)
+
+	def _on_bg_trends(self, key, result):
+		aid = result.get("account_id")
+		if not self._account_exists(aid):
+			return  # the account was removed meanwhile
+		if not result["ok"]:
+			self._bg_failed(aid, result["message"])
+			return
+		self._bg_last_error.pop(aid, None)
+		self._store.set_account_meta(aid, "trends:" + key, json.dumps(result["trends"]))
+		main = self._live_main() if aid == self.account_id() else None
+		if main is not None:
+			for panel in main.getOpenTabs():
+				hook = getattr(panel, "bg_trends", None)
+				if callable(hook):
+					hook(key, result["trends"])
 
 	def _bg_saved_tab(self, aid, entry):
 		"""The tab is not open in the main window (it is closed, or the account is not the active one):
